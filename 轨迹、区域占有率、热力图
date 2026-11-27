@@ -1,0 +1,152 @@
+# -*- coding: utf-8 -*-
+"""Stateful realtime tactical analysis session.
+
+Accumulates per-frame detections into tactical views that a dashboard can
+poll: ball trajectory, positional heatmaps, a 3x3 zone occupancy grid and an
+incremental event stream (geometric rules, same semantics as the offline
+commentary engine).
+"""
+import cv2
+import numpy as np
+
+from src.speech.commentary import BALL, PLAYER, _best_ball, _zone_name
+
+HEAT_GRID = 64          # heatmap resolution
+ZONE_BINS = 3           # 3x3 tactical grid
+TRAJECTORY_LEN = 90     # rolling ball positions kept for the trail
+
+
+class AnalysisSession:
+    """Single-user realtime session (one global instance in the app)."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.frame_count = 0
+        self.play_time = 0.0
+        self.ball_heat = np.zeros((HEAT_GRID, HEAT_GRID), np.float32)
+        self.player_heat = np.zeros((HEAT_GRID, HEAT_GRID), np.float32)
+        self.zone_counts = np.zeros((ZONE_BINS, ZONE_BINS), np.float32)  # row=zone, col=side
+        self.trajectory = []          # [(cx, cy), ...] normalised
+        self.events = []              # all MatchEvent dicts so far
+        self.speed = 0.0              # last ball speed (units/s)
+        self.has_ball = False
+        self.last_players = 0
+        self._last_pos = None
+        self._last_t = None
+        self._last_zone = None
+        self._last_event_t = -1.0
+        self._track_lost = False
+
+    # ------------------------------------------------------------------
+    def update(self, timestamp: float, boxes) -> list[dict]:
+        """Feed one frame's detections; return events newly triggered."""
+        self.frame_count += 1
+        self.play_time = timestamp
+        new_events: list[dict] = []
+
+        ball = _best_ball(boxes)
+        players = [b for b in boxes if b[0] == PLAYER]
+        self.last_players = len(players)
+        self.has_ball = ball is not None
+
+        # --- heatmaps & zone grid ---
+        for _, cx, cy, _, _, _ in players:
+            self._stamp_heat(self.player_heat, cx, cy, weight=0.25)
+        if ball is not None:
+            self._stamp_heat(self.ball_heat, ball[1], ball[2], weight=1.0)
+            row = min(int(ball[2] * ZONE_BINS), ZONE_BINS - 1)
+            col = min(int(ball[1] * ZONE_BINS), ZONE_BINS - 1)
+            self.zone_counts[row, col] += 1.0
+
+        # --- ball trajectory & speed ---
+        if ball is not None:
+            _, bx, by, _, _, _ = ball
+            if self._last_pos is not None:
+                dt = max(timestamp - self._last_t, 1e-3)
+                self.speed = float(np.hypot(bx - self._last_pos[0],
+                                            by - self._last_pos[1]) / dt)
+                if self.speed > 0.55:
+                    new_events.append(self._emit(timestamp, "FAST_MOVE",
+                                                 "一记快速转移，球高速飞行！" if by <= 0.66
+                                                 else "球快速飞向禁区方向，出现射门机会！"))
+                if self._track_lost:
+                    new_events.append(self._emit(timestamp, "REGROUP",
+                                                 "球权发生转换，双方重新组织。"))
+                    self._track_lost = False
+                if np.hypot(bx - self._last_pos[0], by - self._last_pos[1]) > 0.35:
+                    self.trajectory.clear()
+                    self._track_lost = True
+            self._last_pos, self._last_t = (bx, by), timestamp
+            self.trajectory.append((bx, by))
+            if len(self.trajectory) > TRAJECTORY_LEN:
+                self.trajectory.pop(0)
+
+            zone = min(int(by * ZONE_BINS), ZONE_BINS - 1)
+            if self._last_zone is not None and zone != self._last_zone:
+                if zone > self._last_zone:
+                    new_events.append(self._emit(timestamp, "ZONE_ENTER",
+                                                 f"进攻推进，球进入{_zone_name(by)}。"))
+                else:
+                    new_events.append(self._emit(timestamp, "ZONE_ENTER",
+                                                 f"回防成功，球回到{_zone_name(by)}。"))
+            self._last_zone = zone
+        else:
+            self.speed = 0.0
+
+        # --- crowd / possession pressure ---
+        if ball is not None and len(players) >= 5:
+            _, bx, by, _, _, _ = ball
+            near = sum(1 for _, cx, cy, _, _, _ in players
+                       if np.hypot(cx - bx, cy - by) < 0.18)
+            if near >= 5:
+                new_events.append(self._emit(timestamp, "CROWD",
+                                             "禁区内多人混战，球在小范围内快速易手。",
+                                             min_gap=2.0))
+
+        self.events.extend(new_events)
+        return new_events
+
+    # ------------------------------------------------------------------
+    def stats(self) -> dict:
+        return {
+            "frames": self.frame_count,
+            "time": round(self.play_time, 1),
+            "speed": round(self.speed, 3),
+            "events": len(self.events),
+            "players": self.last_players,
+            "ball_visible": self.has_ball,
+        }
+
+    def zone_ratios(self) -> list[list[float]]:
+        """3x3 grid of relative visit frequency (rows top->bottom)."""
+        total = self.zone_counts.sum()
+        if total <= 0:
+            return [[0.0] * ZONE_BINS for _ in range(ZONE_BINS)]
+        return (self.zone_counts / total).round(3).tolist()
+
+    def heatmap_png(self, kind: str = "ball") -> bytes | None:
+        heat = self.ball_heat if kind == "ball" else self.player_heat
+        if heat.max() <= 0:
+            return None
+        norm = (heat / heat.max() * 255).astype(np.uint8)
+        # upsample for a smoother look and apply a colormap
+        norm = cv2.resize(norm, (320, 320), interpolation=cv2.INTER_CUBIC)
+        colored = cv2.applyColorMap(norm, cv2.COLORMAP_JET)
+        ok, buf = cv2.imencode(".png", colored)
+        return buf.tobytes() if ok else None
+
+    # ------------------------------------------------------------------
+    def _stamp_heat(self, heat: np.ndarray, cx: float, cy: float, weight: float):
+        gx = min(int(cx * HEAT_GRID), HEAT_GRID - 1)
+        gy = min(int(cy * HEAT_GRID), HEAT_GRID - 1)
+        heat[gy, gx] += weight
+
+    def _emit(self, t: float, kind: str, text: str, min_gap: float = 1.0) -> dict | None:
+        if t - self._last_event_t < min_gap:
+            return None
+        self._last_event_t = t
+        minutes, seconds = int(t // 60), int(t % 60)
+        return {"time": round(t, 2), "kind": kind,
+                "text": f"[{minutes:02d}:{seconds:02d}] {text}"}
