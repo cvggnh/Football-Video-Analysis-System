@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>足球比赛目标检测与战术分析系统</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">⚽</span>
+      <div>
+        <h1>足球比赛目标检测与战术分析系统</h1>
+        <p>实时检测 · 战术热力 · 智能解说 · 语音播报</p>
+      </div>
+    </div>
+    <div class="top-controls">
+      <div class="ctl">
+        <label>检测模型</label>
+        <select id="modelSelect"></select>
+      </div>
+      <div class="ctl">
+        <label>球员置信度 <span id="confValue">0.25</span></label>
+        <input type="range" id="confSlider" min="0.05" max="0.9" step="0.05" value="0.25">
+        <small>球使用更低阈值 0.2（小目标增强）</small>
+      </div>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="live">实时战术台</button>
+    <button class="tab" data-tab="offline">离线分析</button>
+    <button class="tab" data-tab="speech">语音分析</button>
+  </nav>
+
+  <main>
+    <!-- ============ 实时战术台 ============ -->
+    <section id="tab-live" class="panel active">
+      <div class="live-grid">
+        <!-- 主画面 -->
+        <div class="card main-view">
+          <div class="source-bar">
+            <button class="btn source active" data-source="file">视频文件</button>
+            <button class="btn source" data-source="camera">摄像头</button>
+            <button class="btn source" data-source="screen">屏幕共享</button>
+            <input type="file" id="videoInput" accept="video/*" hidden>
+          </div>
+          <div class="stage">
+            <video id="stageVideo" playsinline muted></video>
+            <canvas id="overlay"></canvas>
+          </div>
+          <div class="stage-controls">
+            <button id="playBtn" class="btn primary">▶ 开始分析</button>
+            <button id="resetBtn" class="btn">重置统计</button>
+            <label class="switch">
+              <input type="checkbox" id="announceToggle" checked>
+              <span>事件语音播报</span>
+            </label>
+            <span id="pumpStatus" class="status">未开始</span>
+          </div>
+        </div>
+
+        <!-- 数据面板 -->
+        <div class="side-col">
+          <div class="card">
+            <h2>实时指标</h2>
+            <div class="stat-row" id="liveStats">
+              <div class="stat-chip"><b id="stPlayers">0</b><span>球员数</span></div>
+              <div class="stat-chip"><b id="stSpeed">0</b><span>球速 u/s</span></div>
+              <div class="stat-chip"><b id="stEvents">0</b><span>事件数</span></div>
+              <div class="stat-chip"><b id="stFrames">0</b><span>分析帧数</span></div>
+            </div>
+          </div>
+          <div class="card">
+            <h2>区域占有率（球）</h2>
+            <div class="zone-grid" id="zoneGrid"></div>
+            <div class="zone-axis"><span>守方后场</span><span>中场</span><span>攻方前场</span></div>
+          </div>
+          <div class="card">
+            <h2>位置热力图 <span class="heat-toggle">
+              <button class="mini active" data-heat="ball">球</button>
+              <button class="mini" data-heat="player">球员</button></span></h2>
+            <img id="heatImg" class="heatmap" alt="热力图">
+          </div>
+        </div>
+      </div>
+
+      <!-- 语音控制台 -->
+      <div class="card console">
+        <h2>语音解说控制台</h2>
+        <div class="console-grid">
+          <div class="console-events">
+            <h3>事件流</h3>
+            <div id="eventList" class="events empty">开始分析后，事件将实时出现在这里</div>
+          </div>
+          <div class="console-broadcast">
+            <h3>实时播报</h3>
+            <div id="broadcastText" class="broadcast-text">等待事件…</div>
+            <audio id="broadcastAudio" controls></audio>
+          </div>
+          <div class="console-asr">
+            <h3>麦克风解说识别</h3>
+            <button id="micBtn" class="btn">🎙 开始录音</button>
+            <div id="micStatus" class="status"></div>
+            <div id="micResult" class="mic-result empty">—</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 离线分析 ============ -->
+    <section id="tab-offline" class="panel">
+      <div class="grid-2">
+        <div class="card">
+          <h2>图像检测</h2>
+          <div id="imageDrop" class="dropzone"><p>点击或拖拽比赛图片</p></div>
+          <input type="file" id="imageInput" accept="image/*" hidden>
+          <button id="detectBtn" class="btn primary">检测</button>
+          <div class="stat-row" id="imageStats" style="margin-top:12px"></div>
+          <ul id="commentaryList" class="commentary empty" style="margin-top:12px">—</ul>
+          <button id="speakCommentary" class="btn" disabled style="margin-top:10px">播报解说</button>
+        </div>
+        <div class="card">
+          <h2>检测结果</h2>
+          <div id="imageResultWrap" class="result-view empty">等待上传…</div>
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="card">
+          <h2>视频片段深度分析</h2>
+          <div id="videoDrop" class="dropzone"><p>点击或拖拽视频（≤30 秒）</p></div>
+          <input type="file" id="videoFileInput" accept="video/*" hidden>
+          <button id="videoBtn" class="btn primary">分析</button>
+          <div class="stat-row" id="videoStats" style="margin-top:12px"></div>
+        </div>
+        <div class="card">
+          <h2>标注视频与事件</h2>
+          <div id="videoResultWrap" class="result-view empty">等待上传…</div>
+          <div id="offlineEvents" class="events empty" style="margin-top:10px">—</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ 语音分析 ============ -->
+    <section id="tab-speech" class="panel">
+      <div class="grid-2">
+        <div class="card">
+          <h2>解说词语音合成（离线 TTS）</h2>
+          <textarea id="ttsText" rows="6" placeholder="输入解说词生成语音"></textarea>
+          <button id="ttsBtn" class="btn primary">生成语音</button>
+          <div id="ttsResult" class="audio-box empty">—</div>
+        </div>
+        <div class="card">
+          <h2>音频转写与关键词分析（ASR）</h2>
+          <div id="asrDrop" class="dropzone"><p>点击或拖拽音频（wav/mp3/m4a/webm）</p></div>
+          <input type="file" id="asrInput" accept="audio/*" hidden>
+          <button id="asrBtn" class="btn primary">转写分析</button>
+          <div class="stat-row" id="asrStats" style="margin-top:12px"></div>
+          <div id="asrKeywords" class="keywords empty"></div>
+          <div id="asrText" class="transcript empty">—</div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>基于 YOLO 的足球比赛目标检测与分析系统 · 图像模态：YOLOv8n / 改进 P2+BiFPN · 语音模态：Kokoro TTS + Whisper ASR</p>
+  </footer>
+  <div id="toast" class="toast"></div>
+  <script src="/js/app.js"></script>
+</body>
+</html>
