@@ -1,0 +1,273 @@
+# -*- coding: utf-8 -*-
+"""FastAPI server for the football detection & analysis system.
+
+Exposes the image modality (detection + statistics) and the speech modality
+(commentary broadcasting via TTS, commentary analysis via ASR).
+"""
+import sys
+import uuid
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
+
+from src.detection.detector import FootballDetector
+from src.detection.session import AnalysisSession
+from src.speech import commentary as cm
+from src.speech.asr import Transcriber
+from src.speech.tts import Broadcaster
+
+WORK_DIR = ROOT / "src" / "app" / "work"
+UPLOAD_DIR = WORK_DIR / "uploads"
+RESULT_DIR = WORK_DIR / "results"
+WEB_DIR = ROOT / "web"
+
+RUNS_DIR = ROOT / "runs"
+DEFAULT_WEIGHTS = "yolov8n_football"
+
+app = FastAPI(title="Football Detection & Analysis System")
+
+_state = {"detector": None, "detector_weights": None}
+_session = AnalysisSession()
+
+
+def _available_weights() -> list[dict]:
+    """Scan runs/ for trained checkpoints plus the pretrained fallback."""
+    items = []
+    for best in sorted(RUNS_DIR.glob("*/weights/best.pt")):
+        run_name = best.parents[1].name
+        if run_name in {"smoke_test"}:
+            continue
+        items.append({"name": run_name, "path": str(best), "trained": True})
+    if not items:
+        fallback = ROOT / "weights" / "yolov8n.pt"
+        if fallback.is_file():
+            items.append({"name": "yolov8n_pretrained", "path": str(fallback),
+                          "trained": False})
+    return items
+
+
+def _resolve_weights(weights: str | None) -> str:
+    items = _available_weights()
+    if not items:
+        raise HTTPException(500, "no model weights available")
+    if weights:
+        for item in items:
+            if item["name"] == weights:
+                return item["path"]
+        raise HTTPException(404, f"unknown model: {weights}")
+    return items[0]["path"]
+
+
+def _get_detector(weights: str) -> FootballDetector:
+    if _state["detector"] is None or _state["detector_weights"] != weights:
+        _state["detector"] = FootballDetector(weights)
+        _state["detector_weights"] = weights
+    return _state["detector"]
+
+
+def _save_upload(upload: UploadFile, suffix: str) -> Path:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    target = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
+    with open(target, "wb") as fh:
+        while chunk := upload.file.read(1 << 20):
+            fh.write(chunk)
+    return target
+
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok", "models": _available_weights()}
+
+
+@app.get("/api/models")
+def list_models():
+    return {"models": _available_weights()}
+
+
+@app.post("/api/detect/image")
+async def detect_image(
+    file: UploadFile = File(...),
+    weights: str | None = Form(None),
+    conf: float = Form(0.25),
+):
+    suffix = Path(file.filename or "img.jpg").suffix or ".jpg"
+    src = _save_upload(file, suffix)
+    detector = _get_detector(_resolve_weights(weights))
+    detector.conf = conf
+
+    import cv2
+    import numpy as np
+
+    data = np.fromfile(str(src), dtype=np.uint8)  # unicode-safe imread
+    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(400, "invalid image file")
+
+    result = detector.detect_image(image)
+    annotated = detector.annotate_image(image)
+
+    RESULT_DIR.mkdir(parents=True, exist_ok=True)
+    out_name = f"{src.stem}_det.jpg"
+    ok, buf = cv2.imencode(".jpg", annotated)
+    buf.tofile(str(RESULT_DIR / out_name))
+
+    state = cm.FrameState(timestamp=0.0, boxes=[
+        (b.class_id, b.cx, b.cy, b.w, b.h, b.conf) for b in result.boxes
+    ])
+    sentences = cm.describe_frame(state)
+
+    return JSONResponse({
+        "annotated_url": f"/files/{out_name}",
+        "stats": result.stats(),
+        "commentary": sentences,
+    })
+
+
+@app.post("/api/detect/video")
+async def detect_video(
+    file: UploadFile = File(...),
+    weights: str | None = Form(None),
+    conf: float = Form(0.25),
+    frame_stride: int = Form(2),
+    max_seconds: float = Form(20.0),
+):
+    suffix = Path(file.filename or "clip.mp4").suffix or ".mp4"
+    src = _save_upload(file, suffix)
+    detector = _get_detector(_resolve_weights(weights))
+    detector.conf = conf
+
+    RESULT_DIR.mkdir(parents=True, exist_ok=True)
+    out_video = RESULT_DIR / f"{src.stem}_det.mp4"
+
+    video = detector.detect_video(
+        str(src), out_path=str(out_video), frame_stride=max(frame_stride, 1),
+        max_frames=int(max_seconds * 25),
+    )
+
+    states = [
+        cm.FrameState(timestamp=i / max(video.fps, 1.0) * max(frame_stride, 1),
+                      boxes=[(b.class_id, b.cx, b.cy, b.w, b.h, b.conf)
+                             for b in fr.boxes])
+        for i, fr in enumerate(video.frame_results)
+    ]
+    events = cm.build_event_stream(states)
+    return JSONResponse({
+        "video_url": f"/files/{out_video.name}",
+        "stats": video.stats(),
+        "events": [{"time": e.time, "kind": e.kind, "text": e.text} for e in events],
+        "script": cm.events_to_script(events),
+    })
+
+
+@app.post("/api/tts")
+async def tts(text: str = Form(...)):
+    if not text.strip():
+        raise HTTPException(400, "empty text")
+    broadcaster = Broadcaster()
+    RESULT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = RESULT_DIR / f"tts_{uuid.uuid4().hex[:8]}.wav"
+    try:
+        broadcaster.synthesize_to_file(text, out_path)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"TTS failed: {exc}") from exc
+    return {"audio_url": f"/files/{out_path.name}"}
+
+
+@app.post("/api/asr")
+async def asr(file: UploadFile = File(...)):
+    suffix = Path(file.filename or "clip.wav").suffix or ".wav"
+    src = _save_upload(file, suffix)
+    transcriber = Transcriber()
+    try:
+        analysis = transcriber.analyze(str(src))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"ASR failed: {exc}") from exc
+    return {
+        "language": analysis.language,
+        "duration": round(analysis.duration, 2),
+        "word_count": analysis.word_count,
+        "keyword_hits": analysis.keyword_hits,
+        "segments": [{"start": s.start, "end": s.end, "text": s.text}
+                     for s in analysis.segments],
+        "text": analysis.text,
+    }
+
+
+@app.post("/api/detect/frame")
+async def detect_frame(
+    file: UploadFile = File(...),
+    weights: str | None = Form(None),
+    conf: float = Form(0.25),
+    timestamp: float = Form(0.0),
+):
+    """Single-frame realtime endpoint: detect + feed the analysis session."""
+    data = await file.read()
+    import cv2
+    import numpy as np
+
+    image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(400, "invalid frame")
+
+    detector = _get_detector(_resolve_weights(weights))
+    detector.conf = conf
+    result = detector.detect_image(image)
+
+    boxes = [(b.class_id, b.cx, b.cy, b.w, b.h, b.conf) for b in result.boxes]
+    new_events = _session.update(timestamp, boxes)
+
+    return JSONResponse({
+        "boxes": [
+            {"cls": b.class_id, "name": b.class_name, "conf": round(b.conf, 3),
+             "cx": round(b.cx, 4), "cy": round(b.cy, 4),
+             "w": round(b.w, 4), "h": round(b.h, 4)}
+            for b in result.boxes
+        ],
+        "events": new_events,
+        "session": _session.stats(),
+        "zones": _session.zone_ratios(),
+        "trajectory": [{"x": x, "y": y} for x, y in _session.trajectory],
+    })
+
+
+@app.post("/api/analyze/reset")
+def analyze_reset():
+    _session.reset()
+    return {"status": "reset"}
+
+
+@app.get("/api/analyze/state")
+def analyze_state():
+    return JSONResponse({
+        "session": _session.stats(),
+        "zones": _session.zone_ratios(),
+        "trajectory": [{"x": x, "y": y} for x, y in _session.trajectory],
+        "events": _session.events[-50:],
+    })
+
+
+@app.get("/api/analyze/heatmap")
+def analyze_heatmap(kind: str = "ball"):
+    png = _session.heatmap_png(kind)
+    if png is None:
+        # 1x1 transparent placeholder keeps <img> happy before any data
+        return Response(content=b"", media_type="image/png", status_code=204)
+    return Response(content=png, media_type="image/png")
+
+
+# static assets and result files (css/js must be mounted explicitly)
+app.mount("/files", StaticFiles(directory=str(RESULT_DIR), check_dir=False),
+          name="files")
+app.mount("/css", StaticFiles(directory=str(WEB_DIR / "css"), check_dir=False))
+app.mount("/js", StaticFiles(directory=str(WEB_DIR / "js"), check_dir=False))
+app.mount("/static", StaticFiles(directory=str(WEB_DIR / "static"), check_dir=False))
+
+
+@app.get("/")
+def index():
+    return FileResponse(str(WEB_DIR / "index.html"))
